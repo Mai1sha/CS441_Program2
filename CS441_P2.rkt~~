@@ -1,0 +1,336 @@
+#lang racket
+
+;; ============================================================
+;; STAGE 0: Comment Stripping
+;; ============================================================
+
+;; strip-comments : String -> String
+;; Removes all /* ... */ comment blocks from the source string.
+;; Non-nesting: the FIRST */ ends the comment, regardless of
+;; how many /* appeared inside it.
+;; Comments are replaced with a single space to preserve token
+;; separation (e.g. "x/*comment*/y" doesn't become "xy").
+(define (strip-comments source)
+  (let loop ([chars (string->list source)]
+             [result '()]
+             [in-comment? #f])
+    (cond
+      ;; --- End of input ---
+      [(null? chars)
+       (if in-comment?
+           (error 'LexicalError "Unterminated comment: reached end of file inside /* ... */")
+           (list->string (reverse result)))]
+
+      ;; --- Inside a comment: look for closing */ ---
+      [in-comment?
+       (cond
+         ;; Found '*' — check if next char is '/'
+         [(and (char=? (car chars) #\*)
+               (not (null? (cdr chars)))
+               (char=? (cadr chars) #\/))
+          ;; Consume both '*' and '/', exit comment, emit one space
+          (loop (cddr chars) (cons #\space result) #f)]
+         ;; Any other char inside comment: discard it
+         [else
+          (loop (cdr chars) result #t)])]
+
+      ;; --- Outside a comment: look for opening /* ---
+      [else
+       (cond
+         ;; Found '/' — check if next char is '*'
+         [(and (char=? (car chars) #\/)
+               (not (null? (cdr chars)))
+               (char=? (cadr chars) #\*))
+          ;; Consume both '/' and '*', enter comment mode
+          (loop (cddr chars) result #t)]
+         ;; Check for a stray */ outside a comment — that's a syntax error
+         [(and (char=? (car chars) #\*)
+               (not (null? (cdr chars)))
+               (char=? (cadr chars) #\/))
+          (error 'SyntaxError "Unexpected */ found outside of a comment block")]
+         ;; Normal character: keep it
+         [else
+          (loop (cdr chars) (cons (car chars) result) #f)])])))
+
+
+;; ============================================================
+;; STAGE 1: Tokenizer
+;; ============================================================
+
+;; Tokens are tagged lists. Examples:
+;;   '(INT-TOK 42)
+;;   '(FP-TOK 3.14)
+;;   '(ID-TOK "myVar")
+;;   '(IF-TOK)
+;;   '(ASSIGN-TOK)     for :=
+;;   '(EQ-TOK)         for =   (comparison only)
+;;   '(NEQ-TOK)        for !=
+;;   '(GT-TOK)         for >
+;;   '(GTE-TOK)        for >=
+;;   '(LT-TOK)         for 
+;;   '(LTE-TOK)        for <=
+;;   '(PLUS-TOK)
+;;   '(MINUS-TOK)
+;;   '(STAR-TOK)
+;;   '(SLASH-TOK)
+;;   '(SEMI-TOK)
+;;   '(LPAREN-TOK)
+;;   '(RPAREN-TOK)
+
+;; Keyword table: maps uppercase strings to their token tags
+(define keywords
+  '(("IF"    . IF-TOK)
+    ("THEN"  . THEN-TOK)
+    ("ELSE"  . ELSE-TOK)
+    ("END"   . END-TOK)
+    ("WHILE" . WHILE-TOK)
+    ("DO"    . DO-TOK)
+    ("PRINT" . PRINT-TOK)))
+
+;; keyword-token? : String -> Symbol or #f
+;; If the string is a keyword, return its token symbol; else #f.
+(define (keyword-token? s)
+  (let ([entry (assoc s keywords)])
+    (if entry (cdr entry) #f)))
+
+;; valid-id-start? : Char -> Boolean
+;; An identifier must start with a letter or underscore.
+(define (valid-id-start? c)
+  (or (char-alphabetic? c) (char=? c #\_)))
+
+;; valid-id-tail? : Char -> Boolean
+;; After the first char, an identifier may contain letters,
+;; digits, underscores, or hyphens.
+(define (valid-id-tail? c)
+  (or (char-alphabetic? c)
+      (char-numeric? c)
+      (char=? c #\_)
+      (char=? c #\-)))
+
+;; lex-number : (Listof Char) String -> (values Token (Listof Char))
+;; Called when we've already collected a sign (or not) and are
+;; now sitting on the first digit. Reads digits, and if it finds
+;; a '.', continues reading as FP.
+;;
+;; Returns the completed token and the remaining characters.
+(define (lex-number chars sign-str)
+  (let loop ([chars chars]
+             [digits '()])  ; digits collected so far (before any '.')
+    (cond
+      [(and (not (null? chars)) (char-numeric? (car chars)))
+       (loop (cdr chars) (cons (car chars) digits))]
+
+      ;; Found a '.': this might be an FP literal
+      [(and (not (null? chars)) (char=? (car chars) #\.))
+       (let ([remaining (cdr chars)])
+         ;; FP rule: must have at least one digit after '.'
+         (when (or (null? remaining) (not (char-numeric? (car remaining))))
+           (error 'LexicalError
+                  "Invalid FP literal: must have at least one digit after '.'"))
+         ;; Check for a second decimal point (e.g. 1.2.3)
+         (let frac-loop ([chars remaining]
+                         [frac-digits '()])
+           (cond
+             [(and (not (null? chars)) (char-numeric? (car chars)))
+              (frac-loop (cdr chars) (cons (car chars) frac-digits))]
+             ;; Second decimal point is illegal
+             [(and (not (null? chars)) (char=? (car chars) #\.))
+              (error 'LexicalError
+                     "Invalid FP literal: multiple decimal points")]
+             [else
+              (let* ([int-part    (list->string (reverse digits))]
+                     [frac-part   (list->string (reverse frac-digits))]
+                     [num-str     (string-append sign-str int-part "." frac-part)]
+                     [num-val     (string->number num-str)])
+                (values `(FP-TOK ,num-val) chars))])))]
+
+      ;; No '.': it's an INT
+      [else
+       (let* ([digit-str (list->string (reverse digits))]
+              [full-str  (string-append sign-str digit-str)])
+         ;; Leading-zero check: "05", "-07" etc. are illegal.
+         ;; The ONLY valid exception is the single digit "0".
+         (when (and (> (string-length digit-str) 1)
+                    (char=? (string-ref digit-str 0) #\0))
+           (error 'LexicalError
+                  (format "Invalid INT: leading zero in '~a'" full-str)))
+         (let ([num-val (string->number full-str)])
+           (values `(INT-TOK ,num-val) chars)))])))
+
+;; tokenize : String -> (Listof Token)
+;; Converts a clean (comment-free) source string into a flat
+;; list of tokens.  The string should have already been through
+;; strip-comments before reaching here.
+(define (tokenize clean-source)
+  (let loop ([chars (string->list clean-source)]
+             [tokens '()]
+             ;; prev-token tracks the most recently emitted token
+             ;; so we can distinguish unary from binary +/-
+             [prev-tok #f])
+
+    (cond
+      ;; --- Done ---
+      [(null? chars)
+       (reverse tokens)]
+
+      ;; --- Skip whitespace ---
+      [(char-whitespace? (car chars))
+       (loop (cdr chars) tokens prev-tok)]
+
+      ;; --- := (must check before lone ':') ---
+      [(and (char=? (car chars) #\:)
+            (not (null? (cdr chars)))
+            (char=? (cadr chars) #\=))
+       (loop (cddr chars) (cons '(ASSIGN-TOK) tokens) '(ASSIGN-TOK))]
+
+      ;; --- Lone ':' is a lexical error ---
+      [(char=? (car chars) #\:)
+       (error 'LexicalError "Unexpected ':' — did you mean ':='?")]
+
+      ;; --- != ---
+      [(and (char=? (car chars) #\!)
+            (not (null? (cdr chars)))
+            (char=? (cadr chars) #\=))
+       (loop (cddr chars) (cons '(NEQ-TOK) tokens) '(NEQ-TOK))]
+
+      ;; --- Lone '!' is a lexical error ---
+      [(char=? (car chars) #\!)
+       (error 'LexicalError "Unexpected '!' — only '!=' is valid")]
+
+      ;; --- >= ---
+      [(and (char=? (car chars) #\>)
+            (not (null? (cdr chars)))
+            (char=? (cadr chars) #\=))
+       (loop (cddr chars) (cons '(GTE-TOK) tokens) '(GTE-TOK))]
+
+      ;; --- > ---
+      [(char=? (car chars) #\>)
+       (loop (cdr chars) (cons '(GT-TOK) tokens) '(GT-TOK))]
+
+      ;; --- <= ---
+      [(and (char=? (car chars) #\<)
+            (not (null? (cdr chars)))
+            (char=? (cadr chars) #\=))
+       (loop (cddr chars) (cons '(LTE-TOK) tokens) '(LTE-TOK))]
+
+      ;; --- < ---
+      [(char=? (car chars) #\<)
+       (loop (cdr chars) (cons '(LT-TOK) tokens) '(LT-TOK))]
+
+      ;; --- = (comparison only) ---
+      [(char=? (car chars) #\=)
+       (loop (cdr chars) (cons '(EQ-TOK) tokens) '(EQ-TOK))]
+
+      ;; --- / (division — NOT a comment start here, comments were stripped) ---
+      [(char=? (car chars) #\/)
+       (loop (cdr chars) (cons '(SLASH-TOK) tokens) '(SLASH-TOK))]
+
+      ;; --- * ---
+      [(char=? (car chars) #\*)
+       (loop (cdr chars) (cons '(STAR-TOK) tokens) '(STAR-TOK))]
+
+      ;; --- ( ---
+      [(char=? (car chars) #\()
+       (loop (cdr chars) (cons '(LPAREN-TOK) tokens) '(LPAREN-TOK))]
+
+      ;; --- ) ---
+      [(char=? (car chars) #\))
+       (loop (cdr chars) (cons '(RPAREN-TOK) tokens) '(RPAREN-TOK))]
+
+      ;; --- ; ---
+      [(char=? (car chars) #\;)
+       (loop (cdr chars) (cons '(SEMI-TOK) tokens) '(SEMI-TOK))]
+
+      ;; --- + or - : unary vs binary ---
+      ;; Binary if previous token was a number, id, or closing paren.
+      ;; Unary (part of the number) otherwise.
+      [(or (char=? (car chars) #\+) (char=? (car chars) #\-))
+       (let* ([ch (car chars)]
+              [binary? (and prev-tok
+                            (memv (car prev-tok)
+                                  '(INT-TOK FP-TOK ID-TOK RPAREN-TOK)))])
+         (if binary?
+             ;; Binary operator: emit as PLUS-TOK or MINUS-TOK
+             (let ([tok (if (char=? ch #\+) '(PLUS-TOK) '(MINUS-TOK))])
+               (loop (cdr chars) (cons tok tokens) tok))
+             ;; Unary sign: peek ahead — must be followed by a digit
+             (let ([sign-str (string ch)]
+                   [rest     (cdr chars)])
+               (when (or (null? rest) (not (char-numeric? (car rest))))
+                 (error 'LexicalError
+                        (format "Unexpected '~a': unary sign must be followed by a digit" ch)))
+               (define-values (num-tok remaining) (lex-number rest sign-str))
+               (loop remaining (cons num-tok tokens) num-tok))))]
+
+      ;; --- Numbers (no sign — sign was handled above) ---
+      [(char-numeric? (car chars))
+       (define-values (num-tok remaining) (lex-number chars ""))
+       (loop remaining (cons num-tok tokens) num-tok)]
+
+      ;; --- Identifiers and Keywords ---
+      [(valid-id-start? (car chars))
+       (let id-loop ([chars (cdr chars)]
+                     [acc   (list (car chars))])
+         (if (and (not (null? chars)) (valid-id-tail? (car chars)))
+             (id-loop (cdr chars) (cons (car chars) acc))
+             (let* ([word (list->string (reverse acc))]
+                    [kw   (keyword-token? word)]
+                    [tok  (if kw `(,kw) `(ID-TOK ,word))])
+               (loop chars (cons tok tokens) tok))))]
+
+      ;; --- Anything else is a lexical error ---
+      [else
+       (error 'LexicalError
+              (format "Unrecognized character: '~a'" (car chars)))])))
+
+
+;; ============================================================
+;; Convenience entry point: run both stages together
+;; ============================================================
+
+;; scan : String -> (Listof Token)
+(define (scan source)
+  (tokenize (strip-comments source)))
+
+;; ============================================================
+;; PARSER HELPERS: peek and consume
+;; ============================================================
+
+;; peek : (Listof Token) -> Token or 'EOF
+;; Returns the first token without removing it.
+;; Returns the symbol 'EOF if the list is empty.
+(define (peek tokens)
+  (if (null? tokens)
+      'EOF
+      (car tokens)))
+
+;; peek-type : (Listof Token) -> Symbol
+;; Returns just the tag of the first token (e.g. 'INT-TOK, 'IF-TOK).
+;; This is what you'll use most often inside parser functions.
+(define (peek-type tokens)
+  (let ([t (peek tokens)])
+    (if (eq? t 'EOF)
+        'EOF
+        (car t))))
+
+;; consume : (Listof Token) Symbol -> (Listof Token)
+;; Checks that the first token matches expected-type.
+;; If yes, returns the REST of the list (cdr).
+;; If no, raises a syntax error.
+(define (consume tokens expected-type)
+  (let ([t (peek tokens)])
+    (cond
+      [(eq? t 'EOF)
+       (error 'SyntaxError
+              (format "Expected ~a but reached end of input" expected-type))]
+      [(eq? (car t) expected-type)
+       (cdr tokens)]
+      [else
+       (error 'SyntaxError
+              (format "Expected ~a but found ~a" expected-type (car t)))])))
+
+;; token-value : Token -> Any
+;; Extracts the value from a token that carries one (INT-TOK, FP-TOK, ID-TOK).
+;; e.g. '(INT-TOK 42) -> 42,  '(ID-TOK "x") -> "x"
+(define (token-value tokens)
+  (cadr (peek tokens)))
